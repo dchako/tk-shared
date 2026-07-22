@@ -34,8 +34,15 @@ def decode_jwt(token: str, settings: Any) -> dict:
     jwt_issuer = getattr(settings, "JWT_ISSUER", None)
     kwargs: dict[str, Any] = {
         "algorithms": algorithms,
-        "options": {"require": ["exp"]},
+        # python-jose usa options por-claim con prefijo `require_<claim>` (a
+        # diferencia de PyJWT, que usa {"require": ["exp"]}) — con la clave
+        # equivocada jose la ignora silenciosamente y el default require_exp=False
+        # queda vigente, así que un token sin `exp` se decodifica igual.
+        "options": {"require_exp": True},
     }
+    # Con `issuer` seteado, jose rechaza tanto un `iss` incorrecto como un
+    # token que directamente no trae el claim (anti token-confusion, M6):
+    # todo JWT emitido por la plataforma debe declarar su emisor.
     if jwt_issuer:
         kwargs["issuer"] = jwt_issuer
 
