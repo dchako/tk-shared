@@ -7,14 +7,18 @@ import pytest
 from fastapi import status
 from jose import jwt
 
-from thunderclouds_shared.auth.core import decode_jwt, verify_internal_secret
+from thunderclouds_shared.auth.core import decode_jwt, get_key_and_alg, verify_internal_secret
 from thunderclouds_shared.auth.dependencies import (
     get_admin_user_id,
     get_current_user_id,
     get_current_user_payload,
     internal_secret_verifier,
 )
-from thunderclouds_shared.auth.exceptions import InvalidInternalSecretError, InvalidTokenError
+from thunderclouds_shared.auth.exceptions import (
+    ImproperlyConfiguredError,
+    InvalidInternalSecretError,
+    InvalidTokenError,
+)
 
 
 class DummySettings:
@@ -255,3 +259,103 @@ async def test_internal_secret_verifier_raises_on_wrong_secret() -> None:
 
     with pytest.raises(InvalidInternalSecretError):
         await dep(x_internal_secret="totally-wrong")
+
+
+# ---------------------------------------------------------------------------
+# P1-16 — verify_internal_secret fail-open when expected is falsy
+# ---------------------------------------------------------------------------
+
+
+def test_verify_internal_secret_rejects_when_expected_is_empty_string() -> None:
+    """A service with an unconfigured secret (expected='') must never pass."""
+    with pytest.raises(InvalidInternalSecretError):
+        verify_internal_secret("", "")
+
+
+def test_verify_internal_secret_rejects_when_expected_is_none() -> None:
+    """Same guarantee when expected is None (misconfigured service)."""
+    with pytest.raises(InvalidInternalSecretError):
+        verify_internal_secret(None, None)  # type: ignore[arg-type]
+
+
+def test_verify_internal_secret_rejects_provided_empty_when_expected_empty() -> None:
+    """Both sides empty: still rejected — fail-closed, not fail-open."""
+    with pytest.raises(InvalidInternalSecretError):
+        verify_internal_secret("", "")
+
+
+def test_verify_internal_secret_rejects_provided_value_when_expected_empty() -> None:
+    """Even a non-empty provided value can't authenticate against an empty expected."""
+    with pytest.raises(InvalidInternalSecretError):
+        verify_internal_secret("some-value", "")
+
+
+# ---------------------------------------------------------------------------
+# P2-59 — cache key is stable content-hash, not id(settings)
+# ---------------------------------------------------------------------------
+
+
+def test_get_key_and_alg_cache_is_content_stable() -> None:
+    """Two separate Settings objects with the same JWT_PUBLIC_KEY hit the same
+    cache entry — the cache key is based on content, not object identity."""
+    import hashlib
+
+    from thunderclouds_shared.auth.core import _PUBLIC_KEY_CACHE, _public_key_cache_key
+
+    pem = "placeholder-not-a-real-pem"
+    key1 = _public_key_cache_key(pem)
+    key2 = _public_key_cache_key(pem)
+
+    assert key1 == key2
+    assert key1 == hashlib.sha256(pem.encode()).hexdigest()
+
+
+def test_get_key_and_alg_cache_keys_differ_for_different_pems() -> None:
+    """Different PEM values produce different cache keys."""
+    from thunderclouds_shared.auth.core import _public_key_cache_key
+
+    assert _public_key_cache_key("pem-a") != _public_key_cache_key("pem-b")
+
+
+# ---------------------------------------------------------------------------
+# P2-60 — malformed PEM raises ImproperlyConfiguredError, not raw ValueError
+# ---------------------------------------------------------------------------
+
+
+class DummySettingsBadPEM:
+    JWT_PUBLIC_KEY = "this-is-not-a-valid-pem"
+    JWT_SECRET_KEY = ""
+    JWT_ALGORITHM = "RS256"
+    JWT_ISSUER = None
+
+
+def test_get_key_and_alg_raises_improperly_configured_on_bad_pem() -> None:
+    """A malformed JWT_PUBLIC_KEY must raise ImproperlyConfiguredError."""
+    # Clear cache to ensure load_pem_public_key is actually called.
+    from thunderclouds_shared.auth.core import _PUBLIC_KEY_CACHE, _public_key_cache_key
+
+    cache_key = _public_key_cache_key(DummySettingsBadPEM.JWT_PUBLIC_KEY)
+    _PUBLIC_KEY_CACHE.pop(cache_key, None)
+
+    with pytest.raises(ImproperlyConfiguredError, match="JWT_PUBLIC_KEY"):
+        get_key_and_alg(DummySettingsBadPEM)
+
+
+def test_get_key_and_alg_bad_pem_not_raw_value_error() -> None:
+    """Malformed PEM must not surface as a raw ValueError (would cause a 500)."""
+    from thunderclouds_shared.auth.core import _PUBLIC_KEY_CACHE, _public_key_cache_key
+
+    cache_key = _public_key_cache_key(DummySettingsBadPEM.JWT_PUBLIC_KEY)
+    _PUBLIC_KEY_CACHE.pop(cache_key, None)
+
+    with pytest.raises(ImproperlyConfiguredError):
+        get_key_and_alg(DummySettingsBadPEM)
+
+    # Must not leak as a plain ValueError
+    try:
+        _PUBLIC_KEY_CACHE.pop(cache_key, None)
+        get_key_and_alg(DummySettingsBadPEM)
+    except ImproperlyConfiguredError:
+        pass
+    except ValueError:
+        pytest.fail("Raw ValueError leaked — should have been ImproperlyConfiguredError")
