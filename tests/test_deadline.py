@@ -277,6 +277,89 @@ async def test_client_no_deadline_header_when_not_set():
     await client.aclose()
 
 
+# ---------------------------------------------------------------------------
+# middleware.py — WARNING + structured fields on 504 enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_middleware_504_emits_warning_not_info(caplog):
+    """Deadline enforcement (504) must emit WARNING, not INFO."""
+    import logging
+    past_epoch = _past_ms(5_000)
+    with caplog.at_level(logging.DEBUG, logger="thunderclouds_shared.http.middleware"):
+        client = TestClient(_make_app())
+        resp = client.get("/ping", headers={HEADER_NAME: str(past_epoch)})
+    assert resp.status_code == 504
+    middleware_records = [
+        r for r in caplog.records
+        if r.name == "thunderclouds_shared.http.middleware"
+    ]
+    assert middleware_records, "Expected at least one log from DeadlineMiddleware"
+    assert any(r.levelname == "WARNING" for r in middleware_records), (
+        "DeadlineMiddleware must log at WARNING level when enforcing 504"
+    )
+    # Must NOT be INFO
+    assert not any(r.levelname == "INFO" for r in middleware_records), (
+        "DeadlineMiddleware must not use INFO for 504 enforcement"
+    )
+
+
+def test_middleware_504_log_has_deadline_enforced_field(caplog):
+    """WARNING log must carry deadline_enforced=True in the extra dict."""
+    import logging
+    past_epoch = _past_ms(5_000)
+    with caplog.at_level(logging.WARNING, logger="thunderclouds_shared.http.middleware"):
+        client = TestClient(_make_app())
+        client.get("/ping", headers={HEADER_NAME: str(past_epoch)})
+    warning = next(
+        (r for r in caplog.records if r.levelname == "WARNING"),
+        None,
+    )
+    assert warning is not None
+    assert getattr(warning, "deadline_enforced", None) is True, (
+        "Log record must have extra field deadline_enforced=True"
+    )
+
+
+def test_middleware_504_log_has_remaining_ms_field(caplog):
+    """WARNING log must carry remaining_ms (negative) in the extra dict."""
+    import logging
+    past_epoch = _past_ms(5_000)
+    with caplog.at_level(logging.WARNING, logger="thunderclouds_shared.http.middleware"):
+        client = TestClient(_make_app())
+        client.get("/ping", headers={HEADER_NAME: str(past_epoch)})
+    warning = next(
+        (r for r in caplog.records if r.levelname == "WARNING"),
+        None,
+    )
+    assert warning is not None
+    rem_field = getattr(warning, "remaining_ms", None)
+    assert rem_field is not None, "Log record must have extra field remaining_ms"
+    assert rem_field < 0, "remaining_ms must be negative for an already-expired deadline"
+
+
+def test_middleware_504_log_has_path_field(caplog):
+    """WARNING log must carry path field matching the request path."""
+    import logging
+    past_epoch = _past_ms(5_000)
+    with caplog.at_level(logging.WARNING, logger="thunderclouds_shared.http.middleware"):
+        client = TestClient(_make_app())
+        client.get("/ping", headers={HEADER_NAME: str(past_epoch)})
+    warning = next(
+        (r for r in caplog.records if r.levelname == "WARNING"),
+        None,
+    )
+    assert warning is not None
+    assert getattr(warning, "path", None) == "/ping", (
+        "Log record must have extra field path matching the request path"
+    )
+
+
+# ---------------------------------------------------------------------------
+# client.py — retry-abort log includes remaining_ms + host/path
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_client_retry_aborted_when_no_budget(monkeypatch):
@@ -310,4 +393,81 @@ async def test_client_retry_aborted_when_no_budget(monkeypatch):
     # Should stop after the 1st attempt (budget is too small for the sleep)
     assert call_count == 1
     assert resp.status_code == 503
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_client_no_budget_log_includes_remaining_ms(caplog):
+    """Retry-abort WARNING must include remaining_ms extra field."""
+    import logging
+    short_deadline = int(time.time() * 1000) + 200  # 200ms left
+
+    async def _flaky(*args, **kwargs):
+        return httpx.Response(503)
+
+    respx.get("http://svc2.test/api/items").mock(side_effect=_flaky)
+
+    client = InternalServiceClient(
+        base_url="http://svc2.test",
+        secret="s",
+        retries=3,
+        backoff_factor=0.5,
+    )
+
+    token = set_deadline(short_deadline)
+    try:
+        with caplog.at_level(logging.WARNING, logger="thunderclouds_shared.http.client"):
+            await client.get("/api/items")
+    finally:
+        reset_deadline(token)
+
+    records = [
+        r for r in caplog.records
+        if "no presupuesto" in r.getMessage().lower()
+    ]
+    assert records, "Expected 'no presupuesto' WARNING from retry-abort path"
+    rec = records[0]
+    assert hasattr(rec, "remaining_ms"), "Log record must have extra field remaining_ms"
+    assert rec.levelname == "WARNING"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_client_no_budget_log_includes_host_and_path(caplog):
+    """Retry-abort WARNING must include host and path extra fields."""
+    import logging
+    short_deadline = int(time.time() * 1000) + 200  # 200ms left
+
+    async def _flaky(*args, **kwargs):
+        return httpx.Response(503)
+
+    respx.get("http://svc3.test/some/endpoint").mock(side_effect=_flaky)
+
+    client = InternalServiceClient(
+        base_url="http://svc3.test",
+        secret="s",
+        retries=3,
+        backoff_factor=0.5,
+    )
+
+    token = set_deadline(short_deadline)
+    try:
+        with caplog.at_level(logging.WARNING, logger="thunderclouds_shared.http.client"):
+            await client.get("/some/endpoint")
+    finally:
+        reset_deadline(token)
+
+    records = [
+        r for r in caplog.records
+        if "no presupuesto" in r.getMessage().lower()
+    ]
+    assert records, "Expected 'no presupuesto' WARNING from retry-abort path"
+    rec = records[0]
+    assert hasattr(rec, "host"), "Log record must have extra field host"
+    assert hasattr(rec, "path"), "Log record must have extra field path"
+    # host should contain the base URL, path the requested path
+    assert "svc3.test" in str(rec.host)
+    assert rec.path == "/some/endpoint"
     await client.aclose()

@@ -51,11 +51,17 @@ class DeadlineMiddleware(BaseHTTPMiddleware):
 
         rem = remaining_ms()
         if rem is not None and rem <= 0:
-            # Already expired before we even start processing
-            logger.info(
-                "deadline_exceeded path=%s remaining_ms=%d",
+            # Already expired before we even start processing — enforce the deadline
+            # by returning 504 immediately without dispatching to the route handler.
+            logger.warning(
+                "deadline_enforced path=%s remaining_ms=%d",
                 request.url.path,
                 rem,
+                extra={
+                    "deadline_enforced": True,
+                    "remaining_ms": rem,
+                    "path": request.url.path,
+                },
             )
             reset_deadline(token)
             body = json.dumps({"error": "deadline_exceeded", "remaining_ms": rem})

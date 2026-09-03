@@ -80,9 +80,15 @@ class InternalServiceClient:
                     raise
                 sleep_ms = self._compute_sleep_ms(attempt)
                 if not self._has_budget_for_retry(sleep_ms):
+                    _rem = remaining_ms()
+                    _host = str(self._client.base_url)
                     logger.warning(
-                        "deadline: no presupuesto para reintentar (sleep_ms=%d), propagando ultimo fallo",
+                        "deadline: no presupuesto para reintentar sleep_ms=%d remaining_ms=%s host=%s path=%s",
                         sleep_ms,
+                        _rem,
+                        _host,
+                        path,
+                        extra={"remaining_ms": _rem, "host": _host, "path": path},
                     )
                     raise
                 await asyncio.sleep(sleep_ms / 1000.0)
@@ -95,9 +101,15 @@ class InternalServiceClient:
                     return response
                 sleep_ms = self._compute_sleep_ms(attempt)
                 if not self._has_budget_for_retry(sleep_ms):
+                    _rem = remaining_ms()
+                    _host = str(self._client.base_url)
                     logger.warning(
-                        "deadline: no presupuesto para reintentar (sleep_ms=%d), propagando ultimo fallo",
+                        "deadline: no presupuesto para reintentar sleep_ms=%d remaining_ms=%s host=%s path=%s",
                         sleep_ms,
+                        _rem,
+                        _host,
+                        path,
+                        extra={"remaining_ms": _rem, "host": _host, "path": path},
                     )
                     return response
                 await asyncio.sleep(sleep_ms / 1000.0)
