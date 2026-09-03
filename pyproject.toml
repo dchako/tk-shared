@@ -6,8 +6,14 @@ build-backend = "setuptools.build_meta"
 name = "thunderclouds-shared"
 version = "0.1.0"
 requires-python = ">=3.11"
+# fastapi NO se declara como dependencia a propósito (incidente 2026-09-02):
+# cada servicio consumidor lo pinea a SU versión exacta (0.110.0 en
+# auth/billing/resources/provisioning; más nueva en bridge/mcp) y declararlo
+# acá hacía que cualquier `pip install thunderclouds-shared` arrastrara el
+# fastapi más nuevo, pisando el pin del host (3 rondas de falsos positivos en
+# tests en un solo día). El host SIEMPRE provee fastapi/starlette; este paquete
+# solo los importa.
 dependencies = [
-    "fastapi>=0.100",
     "python-jose[cryptography]>=3.3",
     "httpx>=0.25",
     "pydantic>=2.0",
