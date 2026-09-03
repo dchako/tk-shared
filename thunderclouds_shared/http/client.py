@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 from typing import Any
 
 import httpx
 
+from thunderclouds_shared.http.deadline import (
+    HEADER_NAME as _DEADLINE_HEADER,
+    deadline_header_value,
+    remaining_ms,
+)
 from thunderclouds_shared.http.exceptions import CircuitBreakerOpenError
+
+logger = logging.getLogger(__name__)
 
 
 class InternalServiceClient:
@@ -59,26 +67,48 @@ class InternalServiceClient:
         request_kwargs["headers"] = self._merge_headers(kwargs.get("headers"))
 
         attempts = self._retries + 1
+        last_response: httpx.Response | None = None
+        last_transport_exc: Exception | None = None
+
         for attempt in range(attempts):
             try:
                 response = await self._client.request(method=method, url=path, **request_kwargs)
-            except httpx.TransportError:
+            except httpx.TransportError as exc:
                 self._record_failure()
+                last_transport_exc = exc
                 if attempt >= self._retries:
                     raise
-                await self._sleep_before_retry(attempt)
+                sleep_ms = self._compute_sleep_ms(attempt)
+                if not self._has_budget_for_retry(sleep_ms):
+                    logger.warning(
+                        "deadline: no presupuesto para reintentar (sleep_ms=%d), propagando ultimo fallo",
+                        sleep_ms,
+                    )
+                    raise
+                await asyncio.sleep(sleep_ms / 1000.0)
                 continue
 
             if response.status_code in {502, 503, 504}:
                 self._record_failure()
+                last_response = response
                 if attempt >= self._retries:
                     return response
-                await self._sleep_before_retry(attempt)
+                sleep_ms = self._compute_sleep_ms(attempt)
+                if not self._has_budget_for_retry(sleep_ms):
+                    logger.warning(
+                        "deadline: no presupuesto para reintentar (sleep_ms=%d), propagando ultimo fallo",
+                        sleep_ms,
+                    )
+                    return response
+                await asyncio.sleep(sleep_ms / 1000.0)
                 continue
 
             self._record_success()
             return response
 
+        # Should be unreachable, but keep the compiler happy.
+        if last_response is not None:
+            return last_response
         raise RuntimeError("Unexpected retry loop termination")
 
     def _merge_headers(self, headers: Any) -> dict[str, str]:
@@ -86,12 +116,28 @@ class InternalServiceClient:
         if headers:
             merged.update(dict(headers))
         merged[self._auth_header] = self._secret
+        # Propagate deadline header if a deadline is active in this context.
+        dh = deadline_header_value()
+        if dh is not None:
+            merged[_DEADLINE_HEADER] = dh
         return merged
 
+    def _compute_sleep_ms(self, attempt: int) -> float:
+        """Return the sleep duration in milliseconds for *attempt* (0-based)."""
+        delay_s = self._backoff_factor * (2 ** attempt)
+        jitter_s = random.uniform(0, delay_s / 2 if delay_s > 0 else 0)
+        return (delay_s + jitter_s) * 1000.0
+
+    def _has_budget_for_retry(self, sleep_ms: float, min_budget_ms: int = 500) -> bool:
+        """Return False if sleeping *sleep_ms* would leave < min_budget_ms remaining."""
+        rem = remaining_ms()
+        if rem is None:
+            return True  # no deadline — always allow
+        return (rem - sleep_ms) >= min_budget_ms
+
     async def _sleep_before_retry(self, attempt: int) -> None:
-        delay = self._backoff_factor * (2 ** attempt)
-        jitter = random.uniform(0, delay / 2 if delay > 0 else 0)
-        await asyncio.sleep(delay + jitter)
+        sleep_ms = self._compute_sleep_ms(attempt)
+        await asyncio.sleep(sleep_ms / 1000.0)
 
     def _is_circuit_open(self) -> bool:
         if self._opened_at is None:
